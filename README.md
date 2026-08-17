@@ -4,4 +4,4 @@ Supporting information for the PairFEQ-Net work on **absolute hydration free ene
 
 `./figs` contains the scripts used to reproduce the figures.
 
-`./example` contains example PairFEQ-Net scripts and MLP models for running an enhanced ME ML/MM simulations in aqueous solution.
+`./example` contains example PairFEQ-Net scripts and MLP models for running an enhanced ME ML/MM simulation in aqueous solution.
