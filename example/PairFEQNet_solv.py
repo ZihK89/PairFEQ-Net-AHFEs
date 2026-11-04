@@ -12,20 +12,22 @@ os.environ.setdefault("NUMBA_NUM_THREADS", "4")
 
 import numpy as np
 import openmm as mm
-from openmm import unit
+from openmm import app, unit
 import tensorflow as tf
 
 from utils.network import Molecule, Network
 from utils.charge_response import ChargeResponse
 from utils.barostat import MolecularBarostat, KB
+from utils.system import build_system, add_ml_forces
 
 
 # User settings. Inputs are resolved relative to this script.
 ROOT = Path(__file__).resolve().parent
 MODEL_DIR = ROOT / "trained_model"
-SYSTEM_FILE = ROOT / "inputs/system.xml"
-STATE_FILE = ROOT / "inputs/initial_state.npz"
+INPUT_FILE = ROOT / "input.sdf"
 OUTPUT_DIR = ROOT / "md_output"
+N_WATERS = 1000
+BOX_LENGTH_ANGSTROM = 35.0
 LAMBDA_SCHEDULE = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 CHARGE_SCALING = 1.2
 TEMPERATURE_K = 300.0
@@ -43,20 +45,24 @@ PHYSICAL_GROUPS = ((1 << 32) - 1) ^ (1 << INJECTED_GROUP)
 KCAL = 4.184
 
 
-def run_window(model, z, initial, lambda_value, timestep_fs, platform,
+def platform_properties(platform):
+    return ({"Precision": "mixed", "DeterministicForces": "true", "UseCpuPme": "false"}
+            if platform == "CUDA" else {"Threads": "4", "DeterministicForces": "true"})
+
+
+def run_window(model, z, system_xml, initial, lambda_value, timestep_fs, platform,
                equilibration_steps, production_steps, save_every, output, seed):
     output.mkdir()
-    system = mm.XmlSerializer.deserialize(SYSTEM_FILE.read_text())
-    system.addForce(mm.CMMotionRemover())
+    system = mm.XmlSerializer.deserialize(system_xml)
+    if not any(isinstance(force, mm.CMMotionRemover) for force in system.getForces()):
+        system.addForce(mm.CMMotionRemover())
     nonbonded = next(f for f in system.getForces() if isinstance(f, mm.NonbondedForce))
     injected = next(f for f in system.getForces() if isinstance(f, mm.CustomExternalForce))
     integrator = mm.LangevinIntegrator(TEMPERATURE_K * unit.kelvin,
                                        FRICTION_PS / unit.picosecond, timestep_fs * unit.femtosecond)
     integrator.setConstraintTolerance(1e-6)
     integrator.setRandomNumberSeed(seed)
-    properties = ({"Precision": "mixed", "DeterministicForces": "true", "UseCpuPme": "false"}
-                  if platform == "CUDA" else {"Threads": "4", "DeterministicForces": "true"})
-    context = mm.Context(system, integrator, mm.Platform.getPlatformByName(platform), properties)
+    context = mm.Context(system, integrator, mm.Platform.getPlatformByName(platform), platform_properties(platform))
     context.setParameter("lambda_interpolate", lambda_value)
     context.setPeriodicBoxVectors(*initial["box_nm"])
     context.setPositions(initial["positions_nm"])
@@ -144,11 +150,16 @@ def run(duration_ps=PRODUCTION_PS, equilibration_ps=EQUILIBRATION_PS, timestep_f
     molecule = Molecule()
     molecule.n_atom = len(z)
     model = Network(molecule).load(molecule, MODEL_DIR)
-    with np.load(STATE_FILE) as initial:
-        for index, lambda_value in enumerate(lambda_values):
-            run_window(model, z, initial, lambda_value, timestep_fs, platform,
-                       equilibration_steps, production_steps, save_every,
-                       output / f"window_{index:02d}_lambda_{lambda_value:g}", RANDOM_SEED + index)
+    print(f"Building caffeine + {N_WATERS} waters from {INPUT_FILE.name}", flush=True)
+    system, initial, topology = build_system(INPUT_FILE, z, N_WATERS, BOX_LENGTH_ANGSTROM,
+                                            platform, platform_properties(platform))
+    with (output / "initial.pdb").open("w") as handle:
+        app.PDBFile.writeFile(topology, initial["positions_nm"] * unit.nanometer, handle)
+    system_xml = mm.XmlSerializer.serialize(add_ml_forces(system, len(z)))
+    for index, lambda_value in enumerate(lambda_values):
+        run_window(model, z, system_xml, initial, lambda_value, timestep_fs, platform,
+                   equilibration_steps, production_steps, save_every,
+                   output / f"window_{index:02d}_lambda_{lambda_value:g}", RANDOM_SEED + index)
 
 
 if __name__ == "__main__":
