@@ -4,4 +4,4 @@ Supporting information for the PairFEQ-Net work on **absolute hydration free ene
 
 `./figs` contains the scripts used to reproduce the figures.
 
-`./example` contains example PairFEQ-Net scripts and MLP models for running an enhanced ME ML/MM simulation in aqueous solution.
+`./example` contains a compact [caffeine NPT example](example/README.md) with the full dynamic-charge response force. It runs NPT ML/MM sampling and records physical energies and trajectories; it does not calculate free-energy matrices.

@@ -1,483 +1,163 @@
-"""
-PairFEQ-Net alchemical simulation with dynamic CM5 charge prediction.
+"""Caffeine in water: NPT sampling with the full dynamic-charge response force."""
 
-The ligand intramolecular potential is interpolated from the classical force
-field to PairFEQ-Net over a series of lambda windows. PairFEQ-Net predicts the
-ligand forces, energy, and partial charges at every MD step.
-
-Author: Zihan Kong <zihan.kong-2@postgrad.manchester.ac.uk>
-"""
-
-from __future__ import annotations
-
-import shutil
-from dataclasses import dataclass
+import argparse
+import csv
+import os
 from pathlib import Path
 
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+os.environ.setdefault("NUMBA_NUM_THREADS", "4")
+
 import numpy as np
-import openmm
-import openmm.app
-import openmm.unit as mmunit
+import openmm as mm
+from openmm import unit
 import tensorflow as tf
-from openff.interchange import Interchange
-from openff.interchange.components._packmol import (
-    RHOMBIC_DODECAHEDRON,
-    pack_box,
-)
-from openff.toolkit import ForceField, Molecule
-from openff.toolkit import unit as ffunit
 
-from utils import alchemical
-from utils.network import Molecule as PairNetMolecule, Network
+from utils.network import Molecule, Network
+from utils.charge_response import ChargeResponse
+from utils.barostat import MolecularBarostat, KB
 
 
-# Paths are relative to the example directory.
-INPUT_FILE = Path("input.sdf")
-MODEL_DIR = Path("trained_model")
-OUTPUT_DIR = Path("md_output")
-TRAJECTORY_FILE = Path("solv_coords_12.npz")
-
-# System construction.
-N_WATER_MOLECULES = 1_000
-BOX_LENGTH_ANGSTROM = 35
-
-# Simulation protocol.
+# User settings. Inputs are resolved relative to this script.
+ROOT = Path(__file__).resolve().parent
+MODEL_DIR = ROOT / "trained_model"
+SYSTEM_FILE = ROOT / "inputs/system.xml"
+STATE_FILE = ROOT / "inputs/initial_state.npz"
+OUTPUT_DIR = ROOT / "md_output"
 LAMBDA_SCHEDULE = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
-TEMPERATURE = 300 * mmunit.kelvin
-FRICTION = 5.0 / mmunit.picoseconds
-TIMESTEP = 1.0 * mmunit.femtoseconds
-EQUILIBRATION_TIME = 50 * mmunit.picoseconds
-PRODUCTION_TIME = 3.0 * mmunit.nanoseconds
-SAVE_INTERVAL = 1_000
 CHARGE_SCALING = 1.2
-
-# Runtime safeguards and OpenMM settings.
-FORCE_STABILITY_LIMIT = 1_000.0
-TF_SESSION_CLEAR_INTERVAL = 1_000
-NONBONDED_CUTOFF = 1.0 * mmunit.nanometer
-INITIAL_VELOCITY_TEMPERATURE = 50 * mmunit.kelvin
-BAROSTAT_PRESSURE = 1 * mmunit.bar
+TEMPERATURE_K = 300.0
+PRESSURE_BAR = 1.0
+FRICTION_PS = 5.0
+TIMESTEP_FS = 1.0
+EQUILIBRATION_PS = 50.0
+PRODUCTION_PS = 3000.0
+SAVE_INTERVAL_PS = 1.0
 BAROSTAT_INTERVAL = 50
+RANDOM_SEED = 20261104
+PLATFORM = "CPU"  # Set to "CUDA" for an NVIDIA GPU.
+INJECTED_GROUP = 31
+PHYSICAL_GROUPS = ((1 << 32) - 1) ^ (1 << INJECTED_GROUP)
+KCAL = 4.184
 
 
-@dataclass
-class LigandNonbondedParameters:
-    """Mutable ligand parameters used for on-the-fly charge updates."""
+def run_window(model, z, initial, lambda_value, timestep_fs, platform,
+               equilibration_steps, production_steps, save_every, output, seed):
+    output.mkdir()
+    system = mm.XmlSerializer.deserialize(SYSTEM_FILE.read_text())
+    system.addForce(mm.CMMotionRemover())
+    nonbonded = next(f for f in system.getForces() if isinstance(f, mm.NonbondedForce))
+    injected = next(f for f in system.getForces() if isinstance(f, mm.CustomExternalForce))
+    integrator = mm.LangevinIntegrator(TEMPERATURE_K * unit.kelvin,
+                                       FRICTION_PS / unit.picosecond, timestep_fs * unit.femtosecond)
+    integrator.setConstraintTolerance(1e-6)
+    integrator.setRandomNumberSeed(seed)
+    properties = ({"Precision": "mixed", "DeterministicForces": "true", "UseCpuPme": "false"}
+                  if platform == "CUDA" else {"Threads": "4", "DeterministicForces": "true"})
+    context = mm.Context(system, integrator, mm.Platform.getPlatformByName(platform), properties)
+    context.setParameter("lambda_interpolate", lambda_value)
+    context.setPeriodicBoxVectors(*initial["box_nm"])
+    context.setPositions(initial["positions_nm"])
+    context.applyConstraints(1e-6)
+    response = ChargeResponse(model, z, nonbonded, context, CHARGE_SCALING)
+    dof = 3 * system.getNumParticles() - system.getNumConstraints() - 3
 
-    force: object
-    current_charges: np.ndarray
-    original_charges: np.ndarray
-    sigmas: np.ndarray
-    epsilons: np.ndarray
+    def coordinates():
+        state = context.getState(getPositions=True)
+        return (state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+                state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer))
 
+    def physical_energy(ml_energy=None):
+        if ml_energy is None:
+            positions, _ = coordinates()
+            _, ml_energy, _, _ = response.prediction(positions, lambda_value)
+        state = context.getState(getEnergy=True, groups=PHYSICAL_GROUPS)
+        return state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole) + lambda_value * ml_energy
 
-def predict_charges(prediction, n_atoms, charge_scaling):
-    """Correct the predicted net charge and apply the requested scaling."""
-    ligand_charges = prediction[2].T
-    net_charge = round(sum(ligand_charges[:, 0]))
-    correction = (sum(ligand_charges) - net_charge) / n_atoms
+    def update():
+        positions, box = coordinates()
+        ml_energy, forces, charges = response.evaluate(positions, box, lambda_value)
+        for i, force in enumerate(forces):
+            injected.setParticleParameters(i, i, force)
+        injected.updateParametersInContext(context)
+        return positions, box, ml_energy, charges
 
-    for atom_index in range(n_atoms):
-        ligand_charges[atom_index] -= correction
-        ligand_charges[atom_index] *= charge_scaling
-
-    return ligand_charges
-
-
-def _prepare_alchemical_system(
-    system,
-    ligand_indices,
-    lambda_value,
-    temperature,
-):
-    """Configure nonbonded terms and add the ML/MM interpolation forces."""
-    nonbonded = next(
-        force
-        for force in system.getForces()
-        if isinstance(force, openmm.NonbondedForce)
-    )
-    nonbonded.setNonbondedMethod(openmm.NonbondedForce.PME)
-    nonbonded.setCutoffDistance(NONBONDED_CUTOFF)
-    nonbonded.setUseDispersionCorrection(True)
-
-    n_ligand_atoms = len(ligand_indices)
-    parameters = LigandNonbondedParameters(
-        force=nonbonded,
-        current_charges=np.zeros(n_ligand_atoms),
-        original_charges=np.zeros(n_ligand_atoms),
-        sigmas=np.zeros(n_ligand_atoms),
-        epsilons=np.zeros(n_ligand_atoms),
-    )
-    for local_index, global_index in enumerate(ligand_indices):
-        charge, sigma, epsilon = nonbonded.getParticleParameters(global_index)
-        charge_value = charge.value_in_unit(mmunit.elementary_charge)
-        parameters.current_charges[local_index] = charge_value
-        parameters.original_charges[local_index] = charge_value
-        parameters.sigmas[local_index] = sigma.value_in_unit(mmunit.nanometer)
-        parameters.epsilons[local_index] = epsilon.value_in_unit(
-            mmunit.kilojoule_per_mole
-        )
-
-    system = alchemical.new_nb_force(system, False, ligand_indices)
-    system, ml_force = alchemical.pairnet_force(ligand_indices, system)
-    system, _ = alchemical.ml_interpolation(
-        system,
-        ligand_indices,
-        lambda_value,
-    )
-    system = alchemical.remove_nb(ligand_indices, system)
-    system = alchemical.remove_bond(system, ligand_indices)
-    system.addForce(
-        openmm.MonteCarloBarostat(
-            BAROSTAT_PRESSURE,
-            temperature,
-            BAROSTAT_INTERVAL,
-        )
-    )
-    return system, ml_force, parameters
-
-
-def _load_pairnet_model():
-    """Load ligand atom types and reconstruct the trained inference model."""
-    ligand_atom_types = np.loadtxt(
-        MODEL_DIR / "nuclear_charges.txt",
-        dtype=np.float32,
-    ).reshape(-1)
-
-    tf.config.set_visible_devices([], "GPU") # use CPU to save I/O memory
-    tf.get_logger().setLevel("ERROR")
-
-    molecule = PairNetMolecule()
-    molecule.n_atom = len(ligand_atom_types)
-    keras_model = Network(molecule).load(molecule, MODEL_DIR)
-
-    compiled_inference = tf.function(
-        lambda coordinates, atom_types: keras_model(
-            [coordinates, atom_types],
-            training=False,
-        ),
-        input_signature=[
-            tf.TensorSpec(
-                shape=(1, len(ligand_atom_types), 3),
-                dtype=tf.float32,
-            ),
-            tf.TensorSpec(
-                shape=(1, len(ligand_atom_types)),
-                dtype=tf.float32,
-            ),
-        ],
-    )
-    return ligand_atom_types, compiled_inference
+    update()  # Validate the PME response before any integration.
+    context.setVelocitiesToTemperature(TEMPERATURE_K * unit.kelvin, seed + 10000)
+    context.applyVelocityConstraints(1e-6)
+    barostat = MolecularBarostat(context, physical_energy, TEMPERATURE_K, PRESSURE_BAR,
+                                 nonbonded.getCutoffDistance().value_in_unit(unit.nanometer), seed + 50000)
+    n_frames = production_steps // save_every + 1
+    trajectory = np.lib.format.open_memmap(output / "coordinates.npy", mode="w+",
+        dtype="float64", shape=(n_frames, system.getNumParticles(), 3))
+    boxes = np.lib.format.open_memmap(output / "box_vectors.npy", mode="w+",
+        dtype="float64", shape=(n_frames, 3, 3))
+    charge_history = np.lib.format.open_memmap(output / "charges.npy", mode="w+",
+        dtype="float64", shape=(n_frames, len(z)))
+    total_steps = equilibration_steps + production_steps
+    with (output / "energy.csv").open("w", newline="", buffering=1) as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["production_time_ps", "potential_kcal_mol", "kinetic_kcal_mol",
+                         "total_kcal_mol", "temperature_K", "volume_nm3", "mc_accepted", "mc_attempts"])
+        for step in range(total_steps + 1):
+            if step > 0 and step % BAROSTAT_INTERVAL == 0:
+                barostat.attempt()
+            # Every accepted/rejected MC move is followed by a full force refresh.
+            positions, box, ml_energy, charges = update()
+            production_step = step - equilibration_steps
+            if production_step >= 0 and production_step % save_every == 0:
+                frame = production_step // save_every
+                trajectory[frame], boxes[frame], charge_history[frame] = positions, box, charges
+                potential = physical_energy(ml_energy)
+                kinetic = context.getState(getEnergy=True).getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
+                writer.writerow([production_step * timestep_fs / 1000, potential / KCAL, kinetic / KCAL,
+                                 (potential + kinetic) / KCAL, 2 * kinetic / (KB * dof),
+                                 np.linalg.det(box), barostat.accepted, barostat.attempts])
+            if step < total_steps:
+                integrator.step(1)
+        trajectory.flush()
+        boxes.flush()
+        charge_history.flush()
+    final = context.getState(getPositions=True, getVelocities=True, getParameters=True)
+    (output / "final_state.xml").write_text(mm.XmlSerializer.serialize(final))
+    print(f"lambda={lambda_value:g}: finished NPT; MC accepted {barostat.accepted}/{barostat.attempts}; {output}", flush=True)
 
 
-def _predict_and_update(
-    model,
-    simulation,
-    ligand_indices,
-    ligand_atom_types,
-    ml_force,
-    nonbonded_parameters,
-    lambda_value,
-    charge_scaling,
-    phase,
-    step,
-):
-    """Predict and apply PairFEQ-Net forces and charges for one MD step."""
-    if step % TF_SESSION_CLEAR_INTERVAL == 0:
-        tf.keras.backend.clear_session()
-
-    coordinates = (
-        simulation.context.getState(getPositions=True)
-        .getPositions(asNumpy=True)
-        .in_units_of(mmunit.angstrom)
-    )
-    coordinate_tensor = tf.convert_to_tensor(
-        np.reshape(
-            coordinates[ligand_indices] / mmunit.angstrom,
-            (1, -1, 3),
-        ),
-        dtype=tf.float32,
-    )
-    atom_type_tensor = tf.convert_to_tensor(
-        np.reshape(ligand_atom_types, (1, -1)),
-        dtype=tf.float32,
-    )
-    prediction = [
-        output.numpy()
-        for output in model(coordinate_tensor, atom_type_tensor)
-    ]
-
-    if np.any(prediction[0] >= FORCE_STABILITY_LIMIT):
-        print(
-            f"Error: predicted force exceeded the stability threshold during "
-            f"{phase} at step {step}.",
-            flush=True,
-        )
-        print("Final coordinates (angstrom):", flush=True)
-        print(
-            np.reshape(
-                coordinates[ligand_indices] / mmunit.angstrom,
-                (1, -1, 3),
-            ),
-            flush=True,
-        )
-        print(f"Final energy: {prediction[1][0][0]}", flush=True)
-        return None
-
-    ml_forces = np.reshape(
-        prediction[0]
-        * mmunit.kilocalories_per_mole
-        / mmunit.angstrom,
-        (-1, 3),
-    )
-    ml_forces = lambda_value * ml_forces
-    for local_index, global_index in enumerate(ligand_indices):
-        ml_force.setParticleParameters(
-            local_index,
-            global_index,
-            tuple(ml_forces[local_index]),
-        )
-    ml_force.updateParametersInContext(simulation.context)
-
-    predicted_charges = predict_charges(
-        prediction,
-        len(ligand_indices),
-        charge_scaling,
-    )
-    for local_index, global_index in enumerate(ligand_indices):
-        predicted_charge = np.squeeze(predicted_charges[local_index]).item()
-        updated_charge = (
-            predicted_charge * lambda_value
-            + nonbonded_parameters.original_charges[local_index]
-            * (1 - lambda_value)
-        )
-        nonbonded_parameters.force.setParticleParameters(
-            global_index,
-            updated_charge,
-            nonbonded_parameters.sigmas[local_index] * mmunit.nanometer,
-            nonbonded_parameters.epsilons[local_index]
-            * mmunit.kilojoule_per_mole,
-        )
-        nonbonded_parameters.current_charges[local_index] = updated_charge
-    nonbonded_parameters.force.updateParametersInContext(simulation.context)
-
-    return prediction, ml_forces
-
-
-def _save_sample(
-    simulation,
-    lambda_value,
-    prediction,
-    ml_forces,
-    ligand_indices,
-    charges,
-):
-    """Write one production sample and return its positions and box vectors."""
-    state = simulation.context.getState(getPositions=True, getEnergy=True)
-    positions = state.getPositions().value_in_unit(mmunit.nanometer)
-    box_vectors = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(
-        mmunit.nanometer
-    )
-    total_forces = (
-        simulation.context.getState(getForces=True)
-        .getForces(asNumpy=True)
-        .in_units_of(mmunit.kilocalories_per_mole / mmunit.angstrom)
-    )
-    ligand_total_forces = total_forces[ligand_indices]
-    mm_forces = ligand_total_forces - ml_forces
-
-    with (OUTPUT_DIR / f"energies_{lambda_value}.txt").open("a") as handle:
-        handle.write(f"{prediction[1][0][0]:.8f}\n")
-    with (OUTPUT_DIR / f"MMforces_{lambda_value}.txt").open("a") as handle:
-        np.savetxt(handle, mm_forces)
-    with (OUTPUT_DIR / f"totalforces_{lambda_value}.txt").open("a") as handle:
-        np.savetxt(handle, ligand_total_forces)
-    with (OUTPUT_DIR / f"MLforces_{lambda_value}.txt").open("a") as handle:
-        np.savetxt(handle, ml_forces)
-    with (OUTPUT_DIR / f"charges_{lambda_value}.txt").open("a") as handle:
-        np.savetxt(handle, charges)
-
-    return positions, box_vectors
-
-
-def run_mix(
-    system,
-    ligand_indices,
-    lambda_value,
-    temperature,
-    friction,
-    timestep,
-    charge_scaling,
-    topology,
-    starting_positions,
-    n_equilibration_steps,
-    n_production_steps,
-    n_saved_frames,
-    n_atoms,
-    save_interval,
-    window_index,
-):
-    """Run one alchemical lambda window and return its sampled trajectory."""
-    system, ml_force, nonbonded_parameters = _prepare_alchemical_system(
-        system,
-        ligand_indices,
-        lambda_value,
-        temperature,
-    )
-
-    integrator = openmm.LangevinIntegrator(temperature, friction, timestep)
-    simulation = openmm.app.Simulation(topology, system, integrator)
-    simulation.context.setPositions(starting_positions)
-    simulation.context.setVelocitiesToTemperature(INITIAL_VELOCITY_TEMPERATURE)
-    alchemical.print_information(system, ligand_indices, integrator)
-
-    ligand_atom_types, model = _load_pairnet_model()
-
-    for step in range(n_equilibration_steps):
-        result = _predict_and_update(
-            model,
-            simulation,
-            ligand_indices,
-            ligand_atom_types,
-            ml_force,
-            nonbonded_parameters,
-            lambda_value,
-            charge_scaling,
-            "equilibration",
-            step,
-        )
-        if result is None:
-            break
-        simulation.step(1)
-
-    print("Equilibration finished; starting production.", flush=True)
-    sample_index = 0
-    sampled_coordinates = np.zeros((n_saved_frames, n_atoms, 3))
-    sampled_box_vectors = np.zeros((n_saved_frames, 3, 3))
-
-    for step in range(n_production_steps):
-        result = _predict_and_update(
-            model,
-            simulation,
-            ligand_indices,
-            ligand_atom_types,
-            ml_force,
-            nonbonded_parameters,
-            lambda_value,
-            charge_scaling,
-            "production",
-            step,
-        )
-        if result is None:
-            break
-
-        prediction, ml_forces = result
-        if (step + 1) % save_interval == 0:
-            (
-                sampled_coordinates[sample_index],
-                sampled_box_vectors[sample_index],
-            ) = _save_sample(
-                simulation,
-                lambda_value,
-                prediction,
-                ml_forces,
-                ligand_indices,
-                nonbonded_parameters.current_charges,
-            )
-            sample_index += 1
-
-        simulation.step(1)
-
-    with (OUTPUT_DIR / f"old_charges_{lambda_value}.txt").open("a") as handle:
-        np.savetxt(handle, nonbonded_parameters.original_charges)
-
-    print(
-        f"Collected {sample_index} samples in window {window_index + 1} "
-        f"(lambda = {lambda_value}).",
-        flush=True,
-    )
-    return sampled_coordinates, sampled_box_vectors
-
-
-def _build_solvated_system():
-    """Build the ligand/water topology and its OpenFF interchange object."""
-    ligand = Molecule(str(INPUT_FILE))
-    water = Molecule.from_smiles("[H][O][H]")
-    for atom in water.atoms:
-        atom.metadata["residue_name"] = "HOH"
-
-    topology = pack_box(
-        molecules=[ligand, water],
-        number_of_copies=[1, N_WATER_MOLECULES],
-        box_vectors=(
-            BOX_LENGTH_ANGSTROM
-            * RHOMBIC_DODECAHEDRON
-            * ffunit.angstrom
-        ),
-    )
-    ligand_molecule = topology.molecule(0)
-    ligand_start = topology.molecule_atom_start_index(ligand_molecule)
-    ligand_indices = list(
-        range(ligand_start, ligand_start + ligand_molecule.n_atoms)
-    )
-
-    force_field = ForceField(
-        "openff_unconstrained-2.1.0.offxml",
-        "tip3p.offxml",
-    )
-    interchange = Interchange.from_smirnoff(
-        force_field=force_field,
-        topology=topology,
-    )
-    return topology, ligand_indices, interchange
-
-
-def main():
-    """Run every lambda window and save the combined trajectory."""
-    topology, ligand_indices, interchange = _build_solvated_system()
-
-    if OUTPUT_DIR.exists():
-        shutil.rmtree(OUTPUT_DIR)
-    OUTPUT_DIR.mkdir(parents=True)
-
-    n_equilibration_steps = int(EQUILIBRATION_TIME / TIMESTEP)
-    n_production_steps = int(PRODUCTION_TIME / TIMESTEP)
-    n_saved_frames = n_production_steps // SAVE_INTERVAL
-    n_windows = len(LAMBDA_SCHEDULE)
-    n_atoms = topology.n_atoms
-    starting_positions = interchange.positions.to_openmm()
-
-    all_coordinates = np.zeros((n_windows, n_saved_frames, n_atoms, 3))
-    all_box_vectors = np.zeros((n_windows, n_saved_frames, 3, 3))
-
-    print(f"Running {n_windows} lambda windows.", flush=True)
-    for window_index, lambda_value in enumerate(LAMBDA_SCHEDULE):
-        coordinates, box_vectors = run_mix(
-            interchange.to_openmm_system(),
-            ligand_indices,
-            lambda_value,
-            TEMPERATURE,
-            FRICTION,
-            TIMESTEP,
-            CHARGE_SCALING,
-            interchange.to_openmm_topology(),
-            starting_positions,
-            n_equilibration_steps,
-            n_production_steps,
-            n_saved_frames,
-            n_atoms,
-            SAVE_INTERVAL,
-            window_index,
-        )
-        all_coordinates[window_index] = coordinates
-        all_box_vectors[window_index] = box_vectors
-
-    np.savez_compressed(
-        TRAJECTORY_FILE,
-        coordinates=all_coordinates,
-        box_vectors=all_box_vectors,
-    )
+def run(duration_ps=PRODUCTION_PS, equilibration_ps=EQUILIBRATION_PS, timestep_fs=TIMESTEP_FS,
+        lambda_values=LAMBDA_SCHEDULE, platform=PLATFORM, output=OUTPUT_DIR, save_interval_ps=SAVE_INTERVAL_PS):
+    dt = timestep_fs / 1000
+    intervals = np.asarray([equilibration_ps, duration_ps, save_interval_ps]) / dt if dt > 0 else np.array([np.nan])
+    if (not np.isfinite(intervals).all() or np.any(intervals < 0) or intervals[1] < 1 or intervals[2] < 1
+            or not np.allclose(intervals, np.rint(intervals), rtol=0, atol=1e-7)):
+        raise ValueError("Times must be integer multiples of a positive timestep; production/save times must be positive")
+    if not lambda_values or len(set(lambda_values)) != len(lambda_values) or any(not 0 <= x <= 1 for x in lambda_values):
+        raise ValueError("Provide unique lambda values between 0 and 1")
+    equilibration_steps, production_steps, save_every = np.rint(intervals).astype(int)
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=False)
+    tf.config.set_visible_devices([], "GPU")
+    tf.config.threading.set_intra_op_parallelism_threads(2)
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+    z = np.loadtxt(MODEL_DIR / "nuclear_charges.txt", dtype=np.float32)
+    molecule = Molecule()
+    molecule.n_atom = len(z)
+    model = Network(molecule).load(molecule, MODEL_DIR)
+    with np.load(STATE_FILE) as initial:
+        for index, lambda_value in enumerate(lambda_values):
+            run_window(model, z, initial, lambda_value, timestep_fs, platform,
+                       equilibration_steps, production_steps, save_every,
+                       output / f"window_{index:02d}_lambda_{lambda_value:g}", RANDOM_SEED + index)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--duration-ps", type=float, default=PRODUCTION_PS)
+    parser.add_argument("--equilibration-ps", type=float, default=EQUILIBRATION_PS)
+    parser.add_argument("--timestep-fs", type=float, default=TIMESTEP_FS)
+    parser.add_argument("--save-interval-ps", type=float, default=SAVE_INTERVAL_PS)
+    parser.add_argument("--lambda-values", nargs="+", type=float, default=LAMBDA_SCHEDULE)
+    parser.add_argument("--platform", choices=("CPU", "CUDA"), default=PLATFORM)
+    parser.add_argument("--output", type=Path, default=OUTPUT_DIR)
+    run(**vars(parser.parse_args()))

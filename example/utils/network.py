@@ -232,7 +232,7 @@ class Network:
         ann_params = _read_model_parameters(input_path / "ann_params.txt")
         prescale = np.loadtxt(input_path / "prescale.txt", dtype=np.float64).reshape(-1)
         model = self.build(mol, ann_params, prescale)
-        model.load_weights(str(input_path / "best_model")).expect_partial()
+        model.load_weights(str(input_path / "best_model")).assert_existing_objects_matched().expect_partial()
         self.model = model
         return model
 
