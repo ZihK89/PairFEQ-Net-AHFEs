@@ -1,5 +1,0 @@
-numpy==1.24.3
-scipy==1.13.1
-numba==0.60.0
-openmm==8.2.0
-tensorflow==2.13.0
