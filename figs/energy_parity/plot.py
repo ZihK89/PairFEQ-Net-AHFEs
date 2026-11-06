@@ -1,9 +1,9 @@
-"""Reproduce Figure 4 with NumPy and Matplotlib.
+"""Plot DFT/model energy parity with NumPy and Matplotlib.
 
 Each molecule has 400 geometries: 100 each from MM/ML gas/aqueous trajectories.
 Input model errors already have one global mean energy offset removed per model.
 The displayed R² measures agreement with y=x, not squared Pearson correlation.
-Usage: python figs/fig4/plot.py --output fig4_output
+Usage: python figs/energy_parity/plot.py --output energy_parity_output
 """
 import argparse
 import json
@@ -22,7 +22,7 @@ MODELS = [("mm_centered_error", "#86b5a1", "MM"),
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=Path("fig4_output"))
+    parser.add_argument("--output", type=Path, default=Path("energy_parity_output"))
     output = parser.parse_args().output
     output.mkdir(parents=True, exist_ok=True)
     plt.rcParams.update({
@@ -74,10 +74,10 @@ def main():
                            handlelength=1, handletextpad=.4, borderpad=.35, labelspacing=.3)
         legend.get_frame().set(edgecolor="#666666", linewidth=.65, linestyle=(0, (3, 2)))
     for extension in ["pdf", "png", "svg"]:
-        fig.savefig(output / f"fig4.{extension}", dpi=300)
+        fig.savefig(output / f"energy_parity.{extension}", dpi=300)
     plt.close(fig)
     (output / "statistics.json").write_text(json.dumps(results, indent=2) + "\n")
-    print(f"Saved Figure 4 and statistics to {output.resolve()}")
+    print(f"Saved energy parity and statistics to {output.resolve()}")
 
 
 if __name__ == "__main__":
